@@ -120,9 +120,14 @@ VETO_PATTERNS = (
 MIN_CHARS = 25
 MAX_CHARS = 300
 DEFAULT_LOOKBACK_DAYS = 14
-DEFAULT_SLIDES = 6
+DEFAULT_SLIDES = 12          # cap, not a target — the bar decides how many
 DEFAULT_MIN_SLIDES = 4
 ABSOLUTE_VIEW_FLOOR = 35
+
+# Share of the window a post must beat to earn a slide. At 0.75 only the top
+# quarter of the fortnight qualifies, so a strong two weeks fills the carousel
+# and a weak one produces a short carousel rather than a padded one.
+QUALIFY_PERCENTILE = 0.75
 
 FONT_CANDIDATES_BOLD = (
     "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
@@ -433,11 +438,16 @@ def select(posts: list[Post], want: int, min_slides: int, now: datetime) -> tupl
             best[key] = p
     deduped = sorted(best.values(), key=lambda x: x.score, reverse=True)
 
-    # The bar: beat the median of the window, and clear an absolute floor. An
-    # adaptive bar keeps a quiet fortnight from promoting weak posts.
+    # The bar: beat most of the window, and clear an absolute floor. An adaptive
+    # bar keeps a quiet fortnight from promoting weak posts — the carousel gets
+    # shorter instead of worse.
     scores = sorted(p.score for p in deduped)
-    median = scores[len(scores) // 2] if scores else 0.0
-    bar = max(median, ABSOLUTE_VIEW_FLOOR)
+    if scores:
+        idx = min(int(len(scores) * QUALIFY_PERCENTILE), len(scores) - 1)
+        cutoff = scores[idx]
+    else:
+        cutoff = 0.0
+    bar = max(cutoff, ABSOLUTE_VIEW_FLOOR)
 
     qualified = [p for p in deduped if p.score >= bar][:want]
     if len(qualified) < min_slides:
