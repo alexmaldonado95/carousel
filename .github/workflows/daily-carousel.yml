@@ -17,6 +17,145 @@ on:
         description: "Land it in Metricool as a draft instead of scheduling it"
         type: boolean
         default: false
+      brand:
+        description: "Which account to build for"
+        type: choice
+        options: ["both", "adhd", "realestate"]
+        default: "both"
+      lookback_days:
+        description: "How many days of Threads posts to consider"
+        type: string
+        default: "14"
+
+permissions:
+  contents: read
+
+jobs:
+  carousel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # One job per account. fail-fast off so a problem on one brand does not
+    # cancel the other — they share nothing but the code.
+    strategy:
+      fail-fast: false
+      matrix:
+        brand:
+          - key: adhd
+            handle: "@the.alexmaldonado"
+            kicker: "from my Threads"
+            headline: "What the ADHD internet stopped scrolling for"
+            outro: "If this is your brain too, you're in the right place."
+            hashtags: "#adhd #adhdtiktok #neurodivergent #adhdcommunity #latediagnosedadhd"
+            caption: "{n} things the ADHD side of Threads stopped for this week. Save this one."
+            publish_at: "18:00"
+          - key: realestate
+            handle: "@yourrealestateman.alex"
+            kicker: "from my Threads"
+            headline: "What LA actually stopped to read this week"
+            outro: "Thinking about buying or selling in LA? Send me a message."
+            hashtags: "#losangeles #larealestate #firsttimehomebuyer #homebuyingtips #socalrealestate"
+            caption: "{n} things LA buyers and sellers stopped for this week. Save this one."
+            publish_at: "17:00"
+
+    concurrency:
+      group: daily-carousel-${{ matrix.brand.key }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Decide whether this brand runs now
+        id: gate
+        run: |
+          WANT="${{ inputs.brand || 'both' }}"
+          if [ "$WANT" != "both" ] && [ "$WANT" != "${{ matrix.brand.key }}" ]; then
+            echo "manual run asked for $WANT — skipping ${{ matrix.brand.key }}"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "manual run — continuing"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          hour=$(TZ=America/Los_Angeles date +%H)
+          if [ "$hour" = "08" ]; then
+            echo "local hour is $hour — continuing"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "local hour is $hour — this is the other cron, stopping here"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pillow>=10.0" "requests>=2.31"
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-core || true
+
+      - name: Build the carousel
+        if: steps.gate.outputs.go == 'true'
+        env:
+          METRICOOL_TOKEN: ${{ secrets.METRICOOL_TOKEN }}
+          METRICOOL_USER_ID: ${{ secrets.METRICOOL_USER_ID }}
+          METRICOOL_BLOG_ID: ${{ matrix.brand.key == 'adhd' && secrets.METRICOOL_BLOG_ID || secrets.METRICOOL_BLOG_ID_REALESTATE }}
+          CLOUDINARY_CLOUD: ${{ secrets.CLOUDINARY_CLOUD }}
+          CLOUDINARY_KEY: ${{ secrets.CLOUDINARY_KEY }}
+          CLOUDINARY_SECRET: ${{ secrets.CLOUDINARY_SECRET }}
+          CAROUSEL_HANDLE: ${{ matrix.brand.handle }}
+          CAROUSEL_KICKER: ${{ matrix.brand.kicker }}
+          CAROUSEL_HEADLINE: ${{ matrix.brand.headline }}
+          CAROUSEL_OUTRO: ${{ matrix.brand.outro }}
+          CAROUSEL_HASHTAGS: ${{ matrix.brand.hashtags }}
+          CAROUSEL_CAPTION_LINE: ${{ matrix.brand.caption }}
+        run: |
+          ARGS="--out-dir slides --lookback-days ${{ inputs.lookback_days || '14' }}"
+          ARGS="$ARGS --publish-at ${{ matrix.brand.publish_at }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ inputs.no_publish }}" = "true" ]; then
+            ARGS="$ARGS --no-publish"
+          fi
+          echo "brand: ${{ matrix.brand.key }}"
+          echo "running: python standalone.py $ARGS"
+          python standalone.py $ARGS
+
+      - name: Keep the slides so you can look at them
+        if: always() && steps.gate.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slides-${{ matrix.brand.key }}
+          path: slides/
+          if-no-files-found: ignore
+          retention-days: 14
+name: Daily Threads carousel
+
+# Runners are UTC, so the schedule fires twice and the guard below lets through
+# only the run that is actually 08:00 in Los Angeles. That keeps the job at 8am
+# Pacific across daylight saving instead of drifting an hour every spring.
+on:
+  schedule:
+    - cron: "0 15 * * *"   # 08:00 PDT
+    - cron: "0 16 * * *"   # 08:00 PST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — render the slides but upload and schedule nothing"
+        type: boolean
+        default: true
+      no_publish:
+        description: "Land it in Metricool as a draft instead of scheduling it"
+        type: boolean
+        default: false
       lookback_days:
         description: "How many days of Threads posts to consider"
         type: string
