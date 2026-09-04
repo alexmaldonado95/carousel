@@ -1,0 +1,97 @@
+name: Daily Threads carousel
+
+# Runners are UTC, so the schedule fires twice and the guard below lets through
+# only the run that is actually 08:00 in Los Angeles. That keeps the job at 8am
+# Pacific across daylight saving instead of drifting an hour every spring.
+on:
+  schedule:
+    - cron: "0 15 * * *"   # 08:00 PDT
+    - cron: "0 16 * * *"   # 08:00 PST
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — render the slides but upload and schedule nothing"
+        type: boolean
+        default: true
+      no_publish:
+        description: "Land it in Metricool as a draft instead of scheduling it"
+        type: boolean
+        default: false
+      lookback_days:
+        description: "How many days of Threads posts to consider"
+        type: string
+        default: "14"
+
+concurrency:
+  group: daily-carousel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  carousel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Only continue if it is 8am in Los Angeles
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "manual run — continuing"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          hour=$(TZ=America/Los_Angeles date +%H)
+          if [ "$hour" = "08" ]; then
+            echo "local hour is $hour — continuing"
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "local hour is $hour — this is the other cron, stopping here"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install "pillow>=10.0" "requests>=2.31"
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-core || true
+
+      - name: Build the carousel
+        if: steps.gate.outputs.go == 'true'
+        env:
+          METRICOOL_TOKEN: ${{ secrets.METRICOOL_TOKEN }}
+          METRICOOL_USER_ID: ${{ secrets.METRICOOL_USER_ID }}
+          METRICOOL_BLOG_ID: ${{ secrets.METRICOOL_BLOG_ID }}
+          CLOUDINARY_CLOUD: ${{ secrets.CLOUDINARY_CLOUD }}
+          CLOUDINARY_KEY: ${{ secrets.CLOUDINARY_KEY }}
+          CLOUDINARY_SECRET: ${{ secrets.CLOUDINARY_SECRET }}
+        run: |
+          ARGS="--out-dir slides --lookback-days ${{ inputs.lookback_days || '14' }}"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ inputs.no_publish }}" = "true" ]; then
+            ARGS="$ARGS --no-publish"
+          fi
+          echo "running: python standalone.py $ARGS"
+          python standalone.py $ARGS
+
+      - name: Keep the slides so you can look at them
+        if: always() && steps.gate.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: slides
+          path: slides/
+          if-no-files-found: ignore
+          retention-days: 14
