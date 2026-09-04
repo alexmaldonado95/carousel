@@ -44,7 +44,21 @@ METRICOOL_BASE = "https://app.metricool.com/api"
 CLOUDINARY_BASE = "https://api.cloudinary.com/v1_1"
 
 TIMEZONE_NAME = "America/Los_Angeles"
-HANDLE = "@yourrealestateman.alex"
+
+# Brand-facing strings. Overridable by environment so the same script can be
+# pointed at another Metricool brand without editing code.
+HANDLE = os.environ.get("CAROUSEL_HANDLE", "@the.alexmaldonado")
+COVER_KICKER = os.environ.get("CAROUSEL_KICKER", "from my Threads")
+COVER_HEADLINE = os.environ.get(
+    "CAROUSEL_HEADLINE", "What the ADHD internet stopped scrolling for")
+OUTRO_LINE = os.environ.get(
+    "CAROUSEL_OUTRO", "If this is your brain too, you're in the right place.")
+HASHTAGS = os.environ.get(
+    "CAROUSEL_HASHTAGS",
+    "#adhd #adhdtiktok #neurodivergent #adhdcommunity #latediagnosedadhd")
+CAPTION_LINE = os.environ.get(
+    "CAROUSEL_CAPTION_LINE",
+    "{n} things the ADHD side of Threads stopped for this week. Save this one.")
 
 SLIDE_W, SLIDE_H = 1080, 1350
 MARGIN = 96
@@ -56,14 +70,41 @@ INK = (240, 244, 246)
 INK_SOFT = (150, 167, 176)
 ACCENT = (232, 176, 96)
 
-# Posts carrying the templated agency signature are recycled far less eagerly —
-# they're autolist filler, not the stuff worth putting in front of TikTok.
-TEMPLATE_MARKERS = (
+# Appended boilerplate signatures — cut from the slide text entirely.
+SIGNATURE_MARKERS = (
     "— alex maldonado, circle real estate",
     "- alex maldonado, circle real estate",
     "alex maldonado | circle real estate",
 )
+
+# Stock tails from the autolist's mad-lib generator. These posts read as broken
+# sentences ("With ADHD loves new ideas but hates follow-through because the
+# magic's in the mayhem") and are filler, not the account's real voice. Cutting
+# the tail wouldn't rescue the grammar, so they're just scored way down.
+STOCK_TAILS = (
+    "because the magic's in the mayhem",
+    "so i made peace with my process",
+    "so i learned to design around my brain",
+    "so i built tools that work with it, not against it",
+    "so i design around it now",
+    "yet here i am, still thriving",
+    "but hey, it keeps life interesting",
+    "but somehow, i still pull it off",
+    "and honestly, i'm proud of the chaos",
+    "and i've stopped trying to fight it",
+)
+TEMPLATE_MARKERS = SIGNATURE_MARKERS + STOCK_TAILS
 TEMPLATE_PENALTY = 0.30
+
+# Engagement bait the autolist staples onto the end. Fine in a feed, dead weight
+# on a slide — stripped before rendering.
+BAIT_SUFFIXES = (
+    "this hit.", "this hit", "anyone else?", "anyone else feel this?",
+    "relatable?", "you feel this too?", "this one's personal.",
+    "drop a if you get this.", "drop a if you get this",
+    "be honest — this one's you too, right?", "same.", "let's connect!",
+    "who's with me?", "tell me i'm not alone.",
+)
 
 # Hard veto — these never make a slide regardless of how well they did.
 VETO_PATTERNS = (
@@ -125,9 +166,16 @@ def strip_emoji(text: str) -> str:
     return "".join(out)
 
 
+def straighten(text: str) -> str:
+    """Curly quotes in, straight quotes out — the autolist emits typographic
+    apostrophes and every marker list here is written with plain ones."""
+    return (text.replace("’", "'").replace("‘", "'")
+                .replace("“", '"').replace("”", '"'))
+
+
 def clean_for_slide(text: str) -> str:
-    t = text
-    for marker in TEMPLATE_MARKERS:
+    t = straighten(text)
+    for marker in SIGNATURE_MARKERS:
         idx = t.lower().find(marker)
         if idx != -1:
             t = t[:idx]
@@ -135,6 +183,19 @@ def clean_for_slide(text: str) -> str:
     t = re.sub(r"#\w+", "", t)
     t = re.sub(r"https?://\S+", "", t)
     t = t.replace("*", "")
+    t = re.sub(r"\s+", " ", t).strip()
+
+    # Peel engagement bait off the end, repeatedly — some posts stack two.
+    changed = True
+    while changed:
+        changed = False
+        low = t.lower().rstrip()
+        for bait in BAIT_SUFFIXES:
+            if low.endswith(bait):
+                t = t[: len(t) - len(bait)].rstrip()
+                changed = True
+                break
+
     t = re.sub(r"\s+", " ", t).strip()
     t = t.strip(" -–—|·,")
     return t
@@ -150,12 +211,12 @@ def normalize_key(text: str) -> str:
 
 
 def is_vetoed(text: str) -> bool:
-    low = text.lower()
+    low = straighten(text).lower()
     return any(re.search(p, low) for p in VETO_PATTERNS)
 
 
 def is_templated(text: str) -> bool:
-    low = text.lower()
+    low = straighten(text).lower()
     return any(m in low for m in TEMPLATE_MARKERS)
 
 
@@ -529,12 +590,11 @@ def render_outro() -> Image.Image:
     d = ImageDraw.Draw(img)
     box_w = SLIDE_W - MARGIN * 2
     font, lines, line_h = fit_text(
-        d, "Thinking about buying or selling in LA? Send me a message.",
-        FONT_CANDIDATES_BOLD, box_w, 560, 88, 48)
+        d, OUTRO_LINE, FONT_CANDIDATES_BOLD, box_w, 560, 88, 48)
     y = draw_block(d, lines, font, line_h, 300, 560, MARGIN, INK)
     d.rectangle([MARGIN, y + 50, MARGIN + 140, y + 58], fill=ACCENT)
     sub = load_font(FONT_CANDIDATES_REGULAR, 40)
-    d.text((MARGIN, y + 100), "Alex Maldonado · Circle Real Estate", font=sub, fill=INK_SOFT)
+    d.text((MARGIN, y + 100), f"Follow {HANDLE}", font=sub, fill=INK_SOFT)
     _footer(d, HANDLE, "")
     return img
 
@@ -544,9 +604,7 @@ def build_slides(posts: list[Post], out_dir: Path) -> list[Path]:
     for old in out_dir.glob("slide-*.jpg"):
         old.unlink()
 
-    headline = "What LA actually stopped to read this week"
-    kicker = "from my Threads"
-    images = [render_cover(headline, kicker, len(posts))]
+    images = [render_cover(COVER_HEADLINE, COVER_KICKER, len(posts))]
     for i, p in enumerate(posts, start=1):
         images.append(render_post(p, i, len(posts)))
     images.append(render_outro())
@@ -590,19 +648,12 @@ def cloudinary_upload(path: Path, cloud: str, key: str, secret: str, folder: str
 # caption
 # --------------------------------------------------------------------------- #
 
-HASHTAGS = "#losangeles #larealestate #firsttimehomebuyer #homebuyingtips #socalrealestate"
-
-
 def build_caption(posts: list[Post]) -> tuple[str, str]:
     lead = posts[0].slide_text
     if len(lead) > 110:
         lead = lead[:107].rsplit(" ", 1)[0] + "..."
     title = lead[:88]
-    body = (
-        f"{lead}\n\n"
-        f"{len(posts)} things LA buyers and sellers stopped to read this week. "
-        f"Save this one.\n\n{HASHTAGS}"
-    )
+    body = f"{lead}\n\n{CAPTION_LINE.format(n=len(posts))}\n\n{HASHTAGS}"
     return title, body
 
 
