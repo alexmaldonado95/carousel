@@ -1,12 +1,14 @@
 name: Daily Threads carousel
 
-# Runners are UTC, so the schedule fires twice and the guard below lets through
-# only the run that is actually 08:00 in Los Angeles. That keeps the job at 8am
-# Pacific across daylight saving instead of drifting an hour every spring.
+# One run a day, both brands. Post times are set by --publish-at inside the
+# script (Pacific), not by when GitHub happens to start the job.
 on:
   schedule:
-    - cron: "0 15 * * *"   # 08:00 PDT
-    - cron: "0 16 * * *"   # 08:00 PST
+    # GitHub routinely fires scheduled workflows hours late, so this is "some
+    # time in the morning", not a promise of 08:00. It does not matter: the
+    # carousel is scheduled into Metricool for a fixed local time regardless of
+    # when the job runs.
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -72,19 +74,8 @@ jobs:
             echo "go=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "manual run — continuing"
-            echo "go=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          hour=$(TZ=America/Los_Angeles date +%H)
-          if [ "$hour" = "08" ]; then
-            echo "local hour is $hour — continuing"
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "local hour is $hour — this is the other cron, stopping here"
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          fi
+          echo "local time is $(TZ=America/Los_Angeles date '+%Y-%m-%d %H:%M') Pacific"
+          echo "go=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         if: steps.gate.outputs.go == 'true'
