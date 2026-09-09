@@ -102,6 +102,9 @@ jobs:
           METRICOOL_BLOG_ID: ${{ matrix.brand.key == 'adhd' && secrets.METRICOOL_BLOG_ID || secrets.METRICOOL_BLOG_ID_REALESTATE }}
           CAROUSEL_IMAGE_HOST: github
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GitHub occasionally fires one cron more than once. Only the daily
+          # run refuses to repeat itself; a manual run always goes through.
+          CAROUSEL_SKIP_IF_DONE: ${{ github.event_name == 'schedule' }}
           CAROUSEL_HANDLE: ${{ matrix.brand.handle }}
           CAROUSEL_KICKER: ${{ matrix.brand.kicker }}
           CAROUSEL_HEADLINE: ${{ matrix.brand.headline }}
