@@ -29,8 +29,10 @@ on:
         type: string
         default: "14"
 
+# The slides are hosted from a `media` branch of this repo and served over
+# raw.githubusercontent.com, so the job needs to be able to write to the repo.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   carousel:
@@ -98,9 +100,8 @@ jobs:
           METRICOOL_TOKEN: ${{ secrets.METRICOOL_TOKEN }}
           METRICOOL_USER_ID: ${{ secrets.METRICOOL_USER_ID }}
           METRICOOL_BLOG_ID: ${{ matrix.brand.key == 'adhd' && secrets.METRICOOL_BLOG_ID || secrets.METRICOOL_BLOG_ID_REALESTATE }}
-          CLOUDINARY_CLOUD: ${{ secrets.CLOUDINARY_CLOUD }}
-          CLOUDINARY_KEY: ${{ secrets.CLOUDINARY_KEY }}
-          CLOUDINARY_SECRET: ${{ secrets.CLOUDINARY_SECRET }}
+          CAROUSEL_IMAGE_HOST: github
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CAROUSEL_HANDLE: ${{ matrix.brand.handle }}
           CAROUSEL_KICKER: ${{ matrix.brand.kicker }}
           CAROUSEL_HEADLINE: ${{ matrix.brand.headline }}
