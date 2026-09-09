@@ -4,8 +4,13 @@ Daily Threads carousel.
 
 Pulls the last N days of published Threads posts from Metricool, scores them on
 reach and interaction, throws out the ones that shouldn't be recycled, renders
-the survivors as carousel slides, uploads the slides to Cloudinary, and schedules
-a TikTok photo carousel back through Metricool.
+the survivors as carousel slides, publishes the slides to a public URL, and
+schedules a TikTok photo carousel back through Metricool.
+
+Slides are hosted by default on a `media` branch of this same repository and
+served from raw.githubusercontent.com. That needs no third-party account and no
+key that can expire — the repo is already public and the workflow token already
+has write access. Set CAROUSEL_IMAGE_HOST=cloudinary to use Cloudinary instead.
 
 Designed to run unattended from GitHub Actions once a day.
 
@@ -15,12 +20,15 @@ Designed to run unattended from GitHub Actions once a day.
 
 Environment:
     METRICOOL_TOKEN, METRICOOL_USER_ID, METRICOOL_BLOG_ID
-    CLOUDINARY_CLOUD, CLOUDINARY_KEY, CLOUDINARY_SECRET
+    CAROUSEL_IMAGE_HOST            "github" (default) or "cloudinary"
+    GITHUB_TOKEN, GITHUB_REPOSITORY        for the github host
+    CLOUDINARY_CLOUD, CLOUDINARY_KEY, CLOUDINARY_SECRET   for the cloudinary host
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import math
@@ -655,6 +663,106 @@ def cloudinary_upload(path: Path, cloud: str, key: str, secret: str, folder: str
 
 
 # --------------------------------------------------------------------------- #
+# GitHub image host
+#
+# The slides have to live somewhere Metricool and TikTok can fetch them over
+# plain HTTPS. This repo is already public and the Actions token already has
+# write access to it, so the slides go on a `media` branch and are served from
+# raw.githubusercontent.com. No third-party account, nothing to expire.
+# --------------------------------------------------------------------------- #
+
+GITHUB_API = "https://api.github.com"
+MEDIA_BRANCH = os.environ.get("CAROUSEL_MEDIA_BRANCH", "media")
+
+
+def _gh(token: str):
+    s = requests.Session()
+    s.headers.update({
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    return s
+
+
+def github_ensure_branch(session, repo: str, branch: str) -> None:
+    """Create `branch` off the default branch if it isn't there yet."""
+    r = session.get(f"{GITHUB_API}/repos/{repo}/git/ref/heads/{branch}", timeout=30)
+    if r.status_code == 200:
+        return
+    if r.status_code != 404:
+        raise RuntimeError(f"could not check branch {branch} ({r.status_code}): {r.text[:300]}")
+
+    meta = session.get(f"{GITHUB_API}/repos/{repo}", timeout=30)
+    if meta.status_code >= 300:
+        raise RuntimeError(f"could not read repo {repo} ({meta.status_code}): {meta.text[:300]}")
+    default = meta.json().get("default_branch", "main")
+
+    head = session.get(f"{GITHUB_API}/repos/{repo}/git/ref/heads/{default}", timeout=30)
+    if head.status_code >= 300:
+        raise RuntimeError(f"could not read {default} ({head.status_code}): {head.text[:300]}")
+    sha = head.json()["object"]["sha"]
+
+    made = session.post(
+        f"{GITHUB_API}/repos/{repo}/git/refs",
+        json={"ref": f"refs/heads/{branch}", "sha": sha},
+        timeout=30,
+    )
+    # 422 means someone else created it between our check and our write.
+    if made.status_code >= 300 and made.status_code != 422:
+        raise RuntimeError(f"could not create branch {branch} ({made.status_code}): {made.text[:300]}")
+    log(f"created branch {branch} for slide hosting")
+
+
+def github_upload(session, path: Path, repo: str, branch: str, folder: str) -> str:
+    """Commit one slide and return the raw URL it will be served from."""
+    dest = f"{folder}/{path.name}"
+    payload = {
+        "message": f"carousel: {dest}",
+        "content": base64.b64encode(path.read_bytes()).decode("ascii"),
+        "branch": branch,
+    }
+
+    # A rerun on the same day writes to a path that already exists; the API
+    # needs the blob sha to replace it rather than refusing the commit.
+    existing = session.get(
+        f"{GITHUB_API}/repos/{repo}/contents/{dest}",
+        params={"ref": branch},
+        timeout=30,
+    )
+    if existing.status_code == 200:
+        payload["sha"] = existing.json().get("sha")
+
+    # Both brands run at once and commit to the same branch, so a losing race
+    # comes back as 409/422. Retry rather than fail the day over a collision.
+    for attempt in range(6):
+        r = session.put(f"{GITHUB_API}/repos/{repo}/contents/{dest}", json=payload, timeout=120)
+        if r.status_code < 300:
+            return f"https://raw.githubusercontent.com/{repo}/{branch}/{dest}"
+        if r.status_code not in (409, 422) or attempt == 5:
+            raise RuntimeError(f"GitHub rejected {path.name} ({r.status_code}): {r.text[:400]}")
+        time.sleep(2 + attempt * 2)
+    raise RuntimeError(f"GitHub kept rejecting {path.name}")
+
+
+def verify_public(url: str, attempts: int = 6, pause: float = 3.0) -> None:
+    """Fail loudly here rather than let Metricool schedule a post with dead images."""
+    last = ""
+    for i in range(attempts):
+        try:
+            r = requests.get(url, timeout=30, stream=True)
+            ctype = r.headers.get("Content-Type", "")
+            if r.status_code == 200 and ctype.startswith("image/"):
+                return
+            last = f"{r.status_code} {ctype}"
+        except requests.RequestException as exc:
+            last = str(exc)
+        if i < attempts - 1:
+            time.sleep(pause)
+    raise RuntimeError(f"slide URL is not publicly readable as an image: {url} ({last})")
+
+
+# --------------------------------------------------------------------------- #
 # caption
 # --------------------------------------------------------------------------- #
 
@@ -752,16 +860,33 @@ def main(argv=None) -> int:
         log("dry run — nothing uploaded, nothing scheduled")
         return 0
 
-    cloud = env("CLOUDINARY_CLOUD")
-    key = env("CLOUDINARY_KEY")
-    secret = env("CLOUDINARY_SECRET")
-    folder = f"threads-carousel/{now_local.strftime('%Y-%m-%d')}"
-
+    # Every run gets its own folder, so a rerun never collides with a live post
+    # and raw.githubusercontent.com never serves a cached older slide.
+    stamp = f"{now_local.strftime('%Y-%m-%d')}/{HANDLE.lstrip('@')}/{now_utc.strftime('%H%M%S')}"
+    host = os.environ.get("CAROUSEL_IMAGE_HOST", "github").strip().lower()
     urls = []
-    for p in paths:
-        url = cloudinary_upload(p, cloud, key, secret, folder)
-        log(f"uploaded {p.name}")
-        urls.append(url)
+
+    if host == "cloudinary":
+        cloud = env("CLOUDINARY_CLOUD")
+        key = env("CLOUDINARY_KEY")
+        secret = env("CLOUDINARY_SECRET")
+        for p in paths:
+            urls.append(cloudinary_upload(p, cloud, key, secret, f"threads-carousel/{stamp}"))
+            log(f"uploaded {p.name}")
+    else:
+        repo = env("GITHUB_REPOSITORY")
+        session = _gh(env("GITHUB_TOKEN"))
+        github_ensure_branch(session, repo, MEDIA_BRANCH)
+        for p in paths:
+            urls.append(github_upload(session, p, repo, MEDIA_BRANCH, f"carousel/{stamp}"))
+            log(f"uploaded {p.name}")
+        log(f"slides live under {MEDIA_BRANCH}/carousel/{stamp}/")
+
+    # Metricool will hand these URLs to TikTok. If even one is unreachable the
+    # post fails silently hours later, so check now while we can still stop.
+    verify_public(urls[0])
+    verify_public(urls[-1])
+    log(f"verified {len(urls)} slide URLs are publicly readable")
 
     title, caption = build_caption(chosen)
     when = scheduled_datetime(args.publish_at, now_local)
