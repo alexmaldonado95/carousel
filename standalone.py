@@ -745,6 +745,16 @@ def github_upload(session, path: Path, repo: str, branch: str, folder: str) -> s
     raise RuntimeError(f"GitHub kept rejecting {path.name}")
 
 
+def already_ran_today(repo: str, token: str, day: str, brand_slug: str) -> bool:
+    """GitHub sometimes fires one cron twice. The slide folder is the receipt."""
+    r = _gh(token).get(
+        f"{GITHUB_API}/repos/{repo}/contents/carousel/{day}/{brand_slug}",
+        params={"ref": MEDIA_BRANCH},
+        timeout=30,
+    )
+    return r.status_code == 200
+
+
 def verify_public(url: str, attempts: int = 6, pause: float = 3.0) -> None:
     """Fail loudly here rather than let Metricool schedule a post with dead images."""
     last = ""
@@ -829,6 +839,19 @@ def main(argv=None) -> int:
         pass
     now_local = datetime.now()
 
+    day = now_local.strftime("%Y-%m-%d")
+    brand_slug = HANDLE.lstrip("@")
+    host = os.environ.get("CAROUSEL_IMAGE_HOST", "github").strip().lower()
+
+    # A scheduled run that finds today's slides already published is a duplicate
+    # firing, not a second day's work. Posting again would put the same carousel
+    # on the account twice.
+    if (not args.dry_run and host != "cloudinary"
+            and os.environ.get("CAROUSEL_SKIP_IF_DONE", "").strip().lower() in ("1", "true", "yes")
+            and already_ran_today(env("GITHUB_REPOSITORY"), env("GITHUB_TOKEN"), day, brand_slug)):
+        log(f"{brand_slug} already has a carousel for {day} — skipping this duplicate run")
+        return 0
+
     if args.posts_json:
         rows = json.loads(Path(args.posts_json).read_text())
         if isinstance(rows, dict):
@@ -862,8 +885,7 @@ def main(argv=None) -> int:
 
     # Every run gets its own folder, so a rerun never collides with a live post
     # and raw.githubusercontent.com never serves a cached older slide.
-    stamp = f"{now_local.strftime('%Y-%m-%d')}/{HANDLE.lstrip('@')}/{now_utc.strftime('%H%M%S')}"
-    host = os.environ.get("CAROUSEL_IMAGE_HOST", "github").strip().lower()
+    stamp = f"{day}/{brand_slug}/{now_utc.strftime('%H%M%S')}"
     urls = []
 
     if host == "cloudinary":
