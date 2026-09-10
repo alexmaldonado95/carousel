@@ -5,7 +5,8 @@ Daily Threads carousel.
 Pulls the last N days of published Threads posts from Metricool, scores them on
 reach and interaction, throws out the ones that shouldn't be recycled, renders
 the survivors as carousel slides, publishes the slides to a public URL, and
-schedules a TikTok photo carousel back through Metricool.
+schedules a TikTok photo carousel and an Instagram carousel back through
+Metricool.
 
 Slides are hosted by default on a `media` branch of this same repository and
 served from raw.githubusercontent.com. That needs no third-party account and no
@@ -64,6 +65,9 @@ OUTRO_LINE = os.environ.get(
 HASHTAGS = os.environ.get(
     "CAROUSEL_HASHTAGS",
     "#adhd #adhdtiktok #neurodivergent #adhdcommunity #latediagnosedadhd")
+# Instagram caps a carousel at 10 images; TikTok photo posts allow far more.
+IG_MAX_SLIDES = 10
+
 CAPTION_LINE = os.environ.get(
     "CAROUSEL_CAPTION_LINE",
     "{n} things the ADHD side of Threads stopped for this week. Save this one.")
@@ -913,38 +917,65 @@ def main(argv=None) -> int:
     title, caption = build_caption(chosen)
     when = scheduled_datetime(args.publish_at, now_local)
 
-    body = {
-        "text": caption,
-        "providers": [{"network": "tiktok"}],
-        "publicationDate": {
-            "dateTime": when.strftime("%Y-%m-%dT%H:%M:%S"),
-            "timezone": TIMEZONE_NAME,
-        },
-        "draft": bool(args.no_publish),
-        "autoPublish": True,
-        "shortener": False,
-        "media": urls,
-        "mediaAltText": [],
-        "tiktokData": {
-            "title": title,
-            "privacyOption": "PUBLIC_TO_EVERYONE",
-            "disableComment": False,
-            "disableDuet": False,
-            "disableStitch": False,
-            "commercialContentThirdParty": False,
-            "commercialContentOwnBrand": False,
-            "autoAddMusic": True,
-            "photoCoverIndex": 0,
-        },
+    def post_body(network: str, media: list) -> dict:
+        return {
+            "text": caption,
+            "providers": [{"network": network}],
+            "publicationDate": {
+                "dateTime": when.strftime("%Y-%m-%dT%H:%M:%S"),
+                "timezone": TIMEZONE_NAME,
+            },
+            "draft": bool(args.no_publish),
+            "autoPublish": True,
+            "shortener": False,
+            "media": media,
+            "mediaAltText": [],
+        }
+
+    tiktok_body = post_body("tiktok", urls)
+    tiktok_body["tiktokData"] = {
+        "title": title,
+        "privacyOption": "PUBLIC_TO_EVERYONE",
+        "disableComment": False,
+        "disableDuet": False,
+        "disableStitch": False,
+        "commercialContentThirdParty": False,
+        "commercialContentOwnBrand": False,
+        "autoAddMusic": True,
+        "photoCoverIndex": 0,
+    }
+
+    # A deck longer than Instagram allows loses slides from the middle, not the
+    # end — the cover opens the carousel and the outro carries the follow prompt,
+    # so truncating would throw away the call to action.
+    ig_urls = urls if len(urls) <= IG_MAX_SLIDES else urls[:IG_MAX_SLIDES - 1] + urls[-1:]
+    instagram_body = post_body("instagram", ig_urls)
+    instagram_body["instagramData"] = {
+        "type": "POST",
+        "showReelOnFeed": True,
+        "isAiGenerated": False,
     }
 
     if mc is None:
         log("no Metricool client (posts came from a file) — not scheduling")
         return 0
 
-    result = mc.create_post(body)
     state = "draft" if args.no_publish else "scheduled"
-    log(f"{state} for {when:%Y-%m-%d %H:%M} {TIMEZONE_NAME} — id {result.get('id', '?')}")
+    result = mc.create_post(tiktok_body)
+    log(f"tiktok {state} for {when:%Y-%m-%d %H:%M} {TIMEZONE_NAME} — id {result.get('id', '?')}")
+
+    # Instagram goes in a second post so a rejection here — a reconnected
+    # account, an image count Instagram won't take — cannot drag the TikTok
+    # carousel down with it. It must not pass quietly either: the run fails so
+    # the daily check-in reports it instead of Instagram going silently dark.
+    if len(ig_urls) < len(urls):
+        log(f"instagram deck trimmed to {len(ig_urls)} of {len(urls)} slides (carousel limit)")
+    try:
+        ig_result = mc.create_post(instagram_body)
+    except Exception as exc:  # noqa: BLE001 - the TikTok post is already safe
+        log(f"FAILED: instagram not scheduled: {exc}")
+        return 1
+    log(f"instagram {state} for {when:%Y-%m-%d %H:%M} {TIMEZONE_NAME} — id {ig_result.get('id', '?')}")
     return 0
 
 
