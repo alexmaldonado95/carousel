@@ -6,7 +6,8 @@ Pulls the last N days of published Threads posts from Metricool, scores them on
 reach and interaction, throws out the ones that shouldn't be recycled, renders
 the survivors as carousel slides, publishes the slides to a public URL, and
 schedules a TikTok photo carousel and an Instagram carousel back through
-Metricool.
+Metricool. Each post is used once — a ledger on the media branch keeps every
+day's carousel different from the last.
 
 Slides are hosted by default on a `media` branch of this same repository and
 served from raw.githubusercontent.com. That needs no third-party account and no
@@ -424,10 +425,17 @@ def score_posts(posts: list[Post], now: datetime) -> list[Post]:
     return posts
 
 
-def select(posts: list[Post], want: int, min_slides: int, now: datetime) -> tuple[list[Post], str]:
+def select(posts: list[Post], want: int, min_slides: int, now: datetime,
+           exclude: set[str] | None = None) -> tuple[list[Post], str]:
+    exclude = exclude or set()
     usable: list[Post] = []
     for p in posts:
         if is_vetoed(p.text):
+            continue
+        # Already carried a carousel on a previous day. The lookback window
+        # barely moves between runs, so without this the same top posts win
+        # every morning and every day's carousel is yesterday's carousel.
+        if normalize_key(p.text) in exclude:
             continue
         slide = clean_for_slide(p.text)
         if len(slide) < MIN_CHARS or len(slide) > MAX_CHARS:
@@ -749,6 +757,81 @@ def github_upload(session, path: Path, repo: str, branch: str, folder: str) -> s
     raise RuntimeError(f"GitHub kept rejecting {path.name}")
 
 
+# --------------------------------------------------------------------------- #
+# the used-posts ledger
+#
+# One carousel a day out of a 14-day window means consecutive runs see almost
+# the same posts and pick almost the same winners. The ledger is the memory that
+# stops that: every post that has carried a slide is written down, and later
+# runs skip it until it ages out.
+# --------------------------------------------------------------------------- #
+
+LEDGER_RETENTION_DAYS = 90
+
+
+def _ledger_path(brand_slug: str) -> str:
+    return f"used/{brand_slug}.json"
+
+
+def load_ledger(session, repo: str, brand_slug: str) -> tuple[list[dict], str | None]:
+    """Returns (entries, blob sha). Missing or unreadable is an empty ledger —
+    a bad read must never stop the day's post going out."""
+    try:
+        r = session.get(
+            f"{GITHUB_API}/repos/{repo}/contents/{_ledger_path(brand_slug)}",
+            params={"ref": MEDIA_BRANCH},
+            timeout=30,
+        )
+        if r.status_code == 404:
+            return [], None
+        if r.status_code >= 300:
+            log(f"could not read the used-posts ledger ({r.status_code}) — treating it as empty")
+            return [], None
+        payload = r.json()
+        raw = base64.b64decode(payload["content"]).decode("utf-8")
+        entries = json.loads(raw).get("entries", [])
+        return [e for e in entries if isinstance(e, dict) and e.get("key")], payload.get("sha")
+    except Exception as exc:  # noqa: BLE001 - never fail the run over the ledger
+        log(f"could not read the used-posts ledger ({exc}) — treating it as empty")
+        return [], None
+
+
+def save_ledger(session, repo: str, brand_slug: str, entries: list[dict],
+                sha: str | None, day: str) -> None:
+    cutoff = (datetime.strptime(day, "%Y-%m-%d") - timedelta(days=LEDGER_RETENTION_DAYS)).strftime("%Y-%m-%d")
+    kept = [e for e in entries if e.get("day", day) >= cutoff]
+
+    body = json.dumps({"entries": kept}, indent=1, ensure_ascii=False) + "\n"
+    payload = {
+        "message": f"carousel: record {brand_slug} posts used on {day}",
+        "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
+        "branch": MEDIA_BRANCH,
+    }
+    if sha:
+        payload["sha"] = sha
+
+    for attempt in range(5):
+        r = session.put(
+            f"{GITHUB_API}/repos/{repo}/contents/{_ledger_path(brand_slug)}",
+            json=payload, timeout=60,
+        )
+        if r.status_code < 300:
+            log(f"ledger now remembers {len(kept)} used post(s) for {brand_slug}")
+            return
+        if r.status_code in (409, 422) and attempt < 4:
+            # Lost a race with the other brand's job; re-read and retry.
+            time.sleep(2 + attempt * 2)
+            fresh, payload["sha"] = load_ledger(session, repo, brand_slug)
+            merged = {e["key"]: e for e in fresh}
+            for e in kept:
+                merged.setdefault(e["key"], e)
+            body = json.dumps({"entries": list(merged.values())}, indent=1, ensure_ascii=False) + "\n"
+            payload["content"] = base64.b64encode(body.encode("utf-8")).decode("ascii")
+            continue
+        log(f"could not write the used-posts ledger ({r.status_code}) — the post still went out")
+        return
+
+
 def already_ran_today(repo: str, token: str, day: str, brand_slug: str) -> bool:
     """GitHub sometimes fires one cron twice. The slide folder is the receipt."""
     r = _gh(token).get(
@@ -816,6 +899,8 @@ def parse_args(argv=None):
     ap.add_argument("--out-dir", default="slides")
     ap.add_argument("--posts-json", default="",
                     help="read posts from a local JSON file instead of Metricool (testing)")
+    ap.add_argument("--no-ledger", action="store_true",
+                    help="ignore the used-posts ledger and allow repeats (testing)")
     return ap.parse_args(argv)
 
 
@@ -856,6 +941,20 @@ def main(argv=None) -> int:
         log(f"{brand_slug} already has a carousel for {day} — skipping this duplicate run")
         return 0
 
+    # What has already carried a slide on an earlier day.
+    ledger, ledger_sha, ledger_session = [], None, None
+    if host != "cloudinary" and not args.posts_json and not args.no_ledger:
+        try:
+            ledger_session = _gh(env("GITHUB_TOKEN"))
+            ledger, ledger_sha = load_ledger(ledger_session, env("GITHUB_REPOSITORY"), brand_slug)
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log(f"no ledger this run ({exc})")
+    used = {e["key"] for e in ledger}
+    if used:
+        log(f"{len(used)} post(s) have already been in a carousel — they're off the table")
+
     if args.posts_json:
         rows = json.loads(Path(args.posts_json).read_text())
         if isinstance(rows, dict):
@@ -863,14 +962,23 @@ def main(argv=None) -> int:
         posts = posts_from_rows(rows)
         mc = None
         log(f"loaded {len(posts)} posts from {args.posts_json}")
+        chosen, reason = select(posts, args.slides, args.min_slides, now_utc, used)
     else:
         mc = Metricool(env("METRICOOL_TOKEN"), env("METRICOOL_USER_ID"), env("METRICOOL_BLOG_ID"))
-        start = now_utc - timedelta(days=args.lookback_days)
-        rows = mc.fetch_threads_posts(start, now_utc + timedelta(days=1))
-        posts = posts_from_rows(rows)
-        log(f"pulled {len(posts)} Threads posts from the last {args.lookback_days} days")
+        # Skipping everything already used shrinks the pool a little more each
+        # day, so reach further back rather than running dry or repeating.
+        windows = sorted({args.lookback_days, args.lookback_days * 2, args.lookback_days * 4})
+        chosen, reason = [], "no window tried"
+        for window in windows:
+            start = now_utc - timedelta(days=window)
+            rows = mc.fetch_threads_posts(start, now_utc + timedelta(days=1))
+            posts = posts_from_rows(rows)
+            log(f"pulled {len(posts)} Threads posts from the last {window} days")
+            chosen, reason = select(posts, args.slides, args.min_slides, now_utc, used)
+            if not reason:
+                break
+            log(f"  {reason} — widening the window")
 
-    chosen, reason = select(posts, args.slides, args.min_slides, now_utc)
     if reason:
         log(f"skipping today — {reason}")
         return 0
@@ -963,6 +1071,18 @@ def main(argv=None) -> int:
     state = "draft" if args.no_publish else "scheduled"
     result = mc.create_post(tiktok_body)
     log(f"tiktok {state} for {when:%Y-%m-%d %H:%M} {TIMEZONE_NAME} — id {result.get('id', '?')}")
+
+    # These count as used the moment a post carrying them exists. Recorded here,
+    # before Instagram, so an Instagram failure can't cause tomorrow's run to
+    # rebuild the carousel that already went out on TikTok.
+    if ledger_session is not None:
+        seen = {e["key"] for e in ledger}
+        for p in chosen:
+            k = normalize_key(p.text)
+            if k and k not in seen:
+                ledger.append({"key": k, "day": day})
+                seen.add(k)
+        save_ledger(ledger_session, env("GITHUB_REPOSITORY"), brand_slug, ledger, ledger_sha, day)
 
     # Instagram goes in a second post so a rejection here — a reconnected
     # account, an image count Instagram won't take — cannot drag the TikTok
