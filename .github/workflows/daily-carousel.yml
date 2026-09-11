@@ -28,6 +28,10 @@ on:
         description: "How many days of Threads posts to consider"
         type: string
         default: "14"
+      publish_at:
+        description: "Publish at this Pacific time (HH:MM) instead of the brand's usual slot"
+        type: string
+        default: ""
 
 # The slides are hosted from a `media` branch of this repo and served over
 # raw.githubusercontent.com, so the job needs to be able to write to the repo.
@@ -113,7 +117,9 @@ jobs:
           CAROUSEL_CAPTION_LINE: ${{ matrix.brand.caption }}
         run: |
           ARGS="--out-dir slides --lookback-days ${{ inputs.lookback_days || '14' }}"
-          ARGS="$ARGS --publish-at ${{ matrix.brand.publish_at }}"
+          PUBLISH_AT="${{ inputs.publish_at }}"
+          if [ -z "$PUBLISH_AT" ]; then PUBLISH_AT="${{ matrix.brand.publish_at }}"; fi
+          ARGS="$ARGS --publish-at $PUBLISH_AT"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             ARGS="$ARGS --dry-run"
           fi
