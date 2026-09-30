@@ -57,6 +57,12 @@ jobs:
             hashtags: "#adhd #adhdtiktok #neurodivergent #adhdcommunity #latediagnosedadhd"
             caption: "{n} things the ADHD side of Threads stopped for this week. Save this one."
             publish_at: "18:00"
+            # Sunday only (date +%u). This brand shares its source pool with the
+            # 9am carousel in alexmaldonado95/adhd-carousel: the account
+            # publishes ~6 Threads posts a day and a daily run here consumes
+            # 12-14 of them, which starves that pipeline and repeats its posts.
+            # Weekly also makes the caption above true. Blank = every day.
+            weekly_dow: "7"
           - key: realestate
             handle: "@yourrealestateman.alex"
             kicker: "from my Threads"
@@ -77,6 +83,14 @@ jobs:
           WANT="${{ inputs.brand || 'both' }}"
           if [ "$WANT" != "both" ] && [ "$WANT" != "${{ matrix.brand.key }}" ]; then
             echo "manual run asked for $WANT — skipping ${{ matrix.brand.key }}"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          DOW="${{ matrix.brand.weekly_dow }}"
+          TODAY="$(TZ=America/Los_Angeles date +%u)"
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -n "$DOW" ] \
+             && [ "$TODAY" != "$DOW" ]; then
+            echo "${{ matrix.brand.key }} runs weekly on day $DOW; today is $TODAY - skipping"
             echo "go=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
